@@ -96,11 +96,13 @@ static const struct class my_chardev_class = {
 	.devnode = my_chardev_class_devnode,
 };
 
-static int my_chardev_setup(struct my_chardev *my)
+static int my_chardev_setup(struct my_chardev *my_chardev)
 {
 	int retval;
-	struct device *dev;
 	int major = MAJOR(devno);
+	int cdev_num = 0, device_num = 0;
+	struct device *dev;
+	struct my_chardev *my = my_chardev;
 
 	for (int i = 0; i < DEVICE_NUM; i++) {
 		cdev_init(&my->cdev, &fops);
@@ -108,19 +110,37 @@ static int my_chardev_setup(struct my_chardev *my)
 		retval = cdev_add(&my->cdev, devno, DEVICE_NUM);
 		if (retval) {
 			printk(KERN_ERR"failed to add char device\n");
-			return retval;
+			goto failed;
 		}
+		cdev_num ++;
 
 		dev = device_create(&my_chardev_class, NULL, MKDEV(major, i), NULL, "my_chardev%d", i);
 		if (!dev) {
 			printk(KERN_ERR"device %d create failed\n", i);
-			return PTR_ERR(dev);
+			retval = PTR_ERR(dev);
+			goto failed;
 		}
+		device_num++;
 
 		my ++;
 	}
 
 	return 0;
+
+failed:
+	my = my_chardev;
+	for (int i = 0; i < cdev_num; i++) {
+		cdev_del(&my->cdev);
+		my ++;
+	}
+
+	my = my_chardev;
+	for (int i = 0; i < cdev_num; i++) {
+		device_destroy(&my_chardev_class, MKDEV(major, i));
+		my ++;
+	}
+
+	return -EFAULT;
 }
 
 static int __init my_chardev_init(void)
@@ -136,16 +156,22 @@ static int __init my_chardev_init(void)
 	retval = class_register(&my_chardev_class);
 	if (retval) {
 		printk(KERN_ERR"class register failed\n");
-		return retval;
+		goto failed1;
 	}
 
 	my = kzalloc(sizeof(*my) * DEVICE_NUM, GFP_KERNEL);
 	if (!my) {
 		printk(KERN_ERR"allock memory for my_chardev structure failed\n");
-		return -ENOMEM;
+		goto failed2;
 	}
 
 	return my_chardev_setup(my);
+
+failed2:
+	class_unregister(&my_chardev_class);
+failed1:
+	unregister_chrdev_region(devno, DEVICE_NUM);
+	return retval;
 }
 
 static void __exit my_chardev_exit(void)
