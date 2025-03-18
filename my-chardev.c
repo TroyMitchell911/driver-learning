@@ -1,44 +1,48 @@
 #include "linux/cdev.h"
+#include "linux/container_of.h"
 #include "linux/device/class.h"
 #include "linux/err.h"
 #include "linux/fs.h"
 #include "linux/init.h"
+#include "linux/kdev_t.h"
 #include "linux/kern_levels.h"
 #include "linux/slab.h"
 #include "linux/uaccess.h"
 #include <linux/device.h>
 #include <linux/module.h>
 
-#define DEVICE_NUM	1
+#define DEVICE_NUM	3
 #define MEM_SIZE	0x1000
 
-static struct my_chardev {
-	dev_t devno;
+static dev_t devno;
+
+struct my_chardev {
 	struct cdev cdev;
 	u8 mem[MEM_SIZE];
 }*my;
 
-static char *my_chardev_class_devnode(const struct device *dev, umode_t *mode)
+static int my_chardev_open(struct inode *inode, struct file *file)
 {
-	if (mode)
-		*mode = 0644;
+	struct my_chardev *dev;
+
+	dev = container_of(inode->i_cdev, struct my_chardev, cdev);
+
+	file->private_data = dev;
+	return 0;
 }
-static const struct class my_chardev_class = {
-	.name = "my_chardev",
-	.devnode = my_chardev_class_devnode,
-};
 
 static ssize_t my_chardev_read(struct file *file, char __user *buf,
 			       size_t count, loff_t *ppos)
 {
 	size_t size;
+	struct my_chardev *my_dev = file->private_data;
 
 	if (*ppos >= MEM_SIZE)
 		return 0;
 
 	size = *ppos + count > MEM_SIZE ? MEM_SIZE - *ppos : count;
 
-	if (copy_to_user(buf, my->mem + *ppos, size))
+	if (copy_to_user(buf, my_dev->mem + *ppos, size))
 		return -EFAULT;
 
 	*ppos += size;
@@ -50,13 +54,14 @@ static ssize_t my_chardev_write(struct file *file, const char __user *buf,
 				size_t count, loff_t *ppos)
 {
 	size_t size;
+	struct my_chardev *my_dev = file->private_data;
 
 	if (*ppos >= MEM_SIZE)
 		return 0;
 
 	size = *ppos + count > MEM_SIZE ? MEM_SIZE - *ppos : count;
 
-	if (copy_from_user(my->mem + *ppos, buf, size))
+	if (copy_from_user(my_dev->mem + *ppos, buf, size))
 		return -EFAULT;
 
 	*ppos += size;
@@ -72,59 +77,92 @@ static loff_t my_chardev_llseek(struct file *file, loff_t offset, int orig)
 }
 
 static const struct file_operations fops = {
+	.open = my_chardev_open,
 	.write = my_chardev_write,
 	.read = my_chardev_read,
 	.llseek = my_chardev_llseek,
 };
 
-static int __init my_chardev_init(void)
+static char *my_chardev_class_devnode(const struct device *dev, umode_t *mode)
+{
+	if (mode)
+		*mode = 0444;
+
+	return NULL;
+}
+
+static const struct class my_chardev_class = {
+	.name = "my_chardev",
+	.devnode = my_chardev_class_devnode,
+};
+
+static int my_chardev_setup(struct my_chardev *my)
 {
 	int retval;
 	struct device *dev;
+	int major = MAJOR(devno);
 
-	my = kzalloc(sizeof(*my), GFP_KERNEL);
-	if (!my) {
-		printk(KERN_ERR"allock memory for my_chardev structure failed\n");
-		return -ENOMEM;
+	for (int i = 0; i < DEVICE_NUM; i++) {
+		cdev_init(&my->cdev, &fops);
+		my->cdev.owner = THIS_MODULE;
+		retval = cdev_add(&my->cdev, devno, DEVICE_NUM);
+		if (retval) {
+			printk(KERN_ERR"failed to add char device\n");
+			return retval;
+		}
+
+		dev = device_create(&my_chardev_class, NULL, MKDEV(major, i), NULL, "my_chardev%d", i);
+		if (!dev) {
+			printk(KERN_ERR"device %d create failed\n", i);
+			return PTR_ERR(dev);
+		}
+
+		my ++;
 	}
 
-	retval = alloc_chrdev_region(&my->devno, 0, DEVICE_NUM, "my_chardev");
+	return 0;
+}
+
+static int __init my_chardev_init(void)
+{
+	int retval;
+
+	retval = alloc_chrdev_region(&devno, 0, DEVICE_NUM, "my_chardev");
 	if (retval) {
 		printk(KERN_ERR"alloc dev number failed\n");
 		return retval;
 	}
-
-	cdev_init(&my->cdev, &fops);
-	my->cdev.owner = THIS_MODULE;
-	retval = cdev_add(&my->cdev, my->devno, DEVICE_NUM);
-	if (retval) {
-		printk(KERN_ERR"failed to add char device\n");
-		return retval;
-	}
-
+	
 	retval = class_register(&my_chardev_class);
 	if (retval) {
 		printk(KERN_ERR"class register failed\n");
 		return retval;
 	}
 
-	dev = device_create(&my_chardev_class, NULL, my->devno, NULL, "my_chardev");
-	if (!dev) {
-		printk(KERN_ERR"device create failed\n");
-		return PTR_ERR(dev);
+	my = kzalloc(sizeof(*my) * DEVICE_NUM, GFP_KERNEL);
+	if (!my) {
+		printk(KERN_ERR"allock memory for my_chardev structure failed\n");
+		return -ENOMEM;
 	}
-	return 0;
+
+	return my_chardev_setup(my);
 }
 
 static void __exit my_chardev_exit(void)
 {
-	device_destroy(&my_chardev_class, my->devno);
+	int major = MAJOR(devno);
+
+	for (int i = 0; i < DEVICE_NUM; i++) {
+		device_destroy(&my_chardev_class, MKDEV(major, i));
+	}
 
 	class_unregister(&my_chardev_class);
 
-	cdev_del(&my->cdev);
+	for (int i = 0; i < DEVICE_NUM; i++) {
+		cdev_del(&(my+i)->cdev);
+	}
 
-	unregister_chrdev_region(my->devno, DEVICE_NUM);
+	unregister_chrdev_region(devno, DEVICE_NUM);
 
 	kfree(my);
 }
