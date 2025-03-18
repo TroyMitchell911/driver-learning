@@ -6,6 +6,7 @@
 #include "linux/init.h"
 #include "linux/kdev_t.h"
 #include "linux/kern_levels.h"
+#include "linux/mutex.h"
 #include "linux/slab.h"
 #include "linux/uaccess.h"
 #include <linux/device.h>
@@ -18,6 +19,7 @@ static dev_t devno;
 
 struct my_chardev {
 	struct cdev cdev;
+	struct mutex mutex;
 	u8 mem[MEM_SIZE];
 }*my;
 
@@ -35,17 +37,22 @@ static ssize_t my_chardev_read(struct file *file, char __user *buf,
 			       size_t count, loff_t *ppos)
 {
 	size_t size;
+	unsigned long pos = *ppos;
 	struct my_chardev *my_dev = file->private_data;
 
-	if (*ppos >= MEM_SIZE)
+	if (pos >= MEM_SIZE)
 		return 0;
 
-	size = *ppos + count > MEM_SIZE ? MEM_SIZE - *ppos : count;
+	size = pos + count > MEM_SIZE ? MEM_SIZE - pos : count;
 
-	if (copy_to_user(buf, my_dev->mem + *ppos, size))
+	mutex_lock(&my->mutex);
+
+	if (copy_to_user(buf, my_dev->mem + pos, size))
 		return -EFAULT;
 
 	*ppos += size;
+
+	mutex_unlock(&my->mutex);
 
 	return size;
 }
@@ -54,17 +61,22 @@ static ssize_t my_chardev_write(struct file *file, const char __user *buf,
 				size_t count, loff_t *ppos)
 {
 	size_t size;
+	unsigned long pos = *ppos;
 	struct my_chardev *my_dev = file->private_data;
 
-	if (*ppos >= MEM_SIZE)
+	if (pos >= MEM_SIZE)
 		return 0;
 
-	size = *ppos + count > MEM_SIZE ? MEM_SIZE - *ppos : count;
+	size = pos + count > MEM_SIZE ? MEM_SIZE - pos : count;
 
-	if (copy_from_user(my_dev->mem + *ppos, buf, size))
+	mutex_lock(&my->mutex);
+
+	if (copy_from_user(my_dev->mem + pos, buf, size))
 		return -EFAULT;
 
 	*ppos += size;
+
+	mutex_unlock(&my->mutex);
 
 	return size;
 }
@@ -105,8 +117,11 @@ static int my_chardev_setup(struct my_chardev *my_chardev)
 	struct my_chardev *my = my_chardev;
 
 	for (int i = 0; i < DEVICE_NUM; i++) {
+		mutex_init(&my->mutex);
+
 		cdev_init(&my->cdev, &fops);
 		my->cdev.owner = THIS_MODULE;
+
 		retval = cdev_add(&my->cdev, devno, DEVICE_NUM);
 		if (retval) {
 			printk(KERN_ERR"failed to add char device\n");
